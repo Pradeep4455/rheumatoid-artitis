@@ -1,0 +1,125 @@
+import os
+import json
+import torch
+from torchvision import transforms
+import timm
+from PIL import Image
+from flask import Flask, request, render_template, redirect, url_for, session, flash
+from werkzeug.security import generate_password_hash, check_password_hash
+
+# Flask setup
+app = Flask(name)
+app.secret_key = 'your_secret_key'  # Change this to a random secret key
+app.config['UPLOAD_FOLDER'] = 'static/uploads'
+app.config['USER_DATA'] = 'users.json'  # Path to the user data JSON file
+
+# Parameters
+num_classes = 5
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model_path = 'convnext_model.pth'
+
+# Data transformation
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+
+# Load model
+model = timm.create_model('convnext_small', pretrained=False, num_classes=num_classes)
+model.load_state_dict(torch.load(model_path, map_location=device))
+model = model.to(device)
+model.eval()
+
+# Class names
+class_names = [
+    'Grade 0: Healthy knee image',
+    'Grade 1 (Doubtful): Doubtful joint narrowing with possible osteophytic lipping',
+    'Grade 2 (Minimal): Definite presence of osteophytes and possible joint space narrowing',
+    'Grade 3 (Moderate): Multiple osteophytes, definite joint space narrowing, with mild sclerosis.',
+    'Grade 4 (Severe): Large osteophytes, significant joint narrowing, and severe sclerosis'
+]
+
+# Prediction function
+def predict_image(image_path):
+    img = Image.open(image_path).convert('RGB')
+    img = transform(img).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        output = model(img)
+        _, predicted = torch.max(output, 1)
+
+    return class_names[predicted.item()]
+
+# User authentication functions
+def load_users():
+    if os.path.exists(app.config['USER_DATA']):
+        with open(app.config['USER_DATA'], 'r') as f:
+            return json.load(f)
+    return {}
+
+def save_users(users):
+    with open(app.config['USER_DATA'], 'w') as f:
+        json.dump(users, f)
+
+@app.route("/login_register", methods=["GET", "POST"])
+def login_register():
+    if request.method == "POST":
+        action = request.form.get('action')
+        username = request.form['username']
+        password = request.form['password']
+        users = load_users()
+
+        if action == 'register':
+            if username in users:
+                flash('Username already exists!', 'danger')
+                return redirect(url_for('login_register'))
+
+            users[username] = generate_password_hash(password)
+            save_users(users)
+            flash('Registration successful! You can now log in.', 'success')
+            return redirect(url_for('login_register'))
+
+        elif action == 'login':
+            if username in users and check_password_hash(users[username], password):
+                session['username'] = username
+                flash('Login successful!', 'success')
+                return redirect(url_for('index'))
+
+            flash('Invalid username or password!', 'danger')
+
+    return render_template("login_register.html")
+
+@app.route("/logout")
+def logout():
+    session.pop('username', None)
+    flash('You have been logged out.', 'success')
+    return redirect(url_for('login_register'))
+
+@app.route("/", methods=["GET", "POST"])
+def index():
+    if 'username' not in session:
+        return redirect(url_for('login_register'))
+
+    if request.method == "POST":
+        if 'file' not in request.files:
+            return redirect(request.url)
+        file = request.files['file']
+        if file.filename == '':
+            return redirect(request.url)
+        if file:
+            filename = file.filename
+            file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            file.save(file_path)
+
+            # Perform prediction
+            prediction = predict_image(file_path)
+
+            # Prepare the path for rendering in the template
+            image_path = os.path.join('uploads', filename).replace("\\", "/")
+            return render_template("index.html", prediction=prediction, image_path=image_path)
+
+    return render_template("index.html")
+
+if name == "main":
+    app.run(debug=True)
